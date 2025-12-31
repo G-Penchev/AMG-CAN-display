@@ -28,11 +28,12 @@ uint32_t modeAnnounceStartMs = 0;
 
 enum DriveMode : uint8_t
 {
-  MODE_NORMAL,
+  MODE_COMFORT,
   MODE_SPORT,
-  MODE_SPORTP
+  MODE_SPORTP,
+  MODE_MANUAL
 };
-DriveMode driveMode = MODE_NORMAL;
+DriveMode driveMode = MODE_COMFORT;
 
 // Example CAN values (replace with your real decode)
 int gear = 0;      // -1 R, 0 N, 1..n
@@ -68,7 +69,7 @@ uint8_t currentPage = PAGE_MAIN;
 
 void cycleDriveMode()
 {
-  driveMode = (DriveMode)((driveMode + 1) % 3);
+  driveMode = (DriveMode)((driveMode + 1) % 4);
   uiMode = UI_MODE_ANNOUNCE;
   modeAnnounceStartMs = millis();
 }
@@ -152,14 +153,16 @@ const char *driveModeToShort(DriveMode m)
 {
   switch (m)
   {
-  case MODE_NORMAL:
-    return "N";
+  case MODE_COMFORT:
+    return "C";
   case MODE_SPORT:
     return "S";
   case MODE_SPORTP:
     return "S+";
+  case MODE_MANUAL:
+    return "M";
   default:
-    return "N";
+    return "C";
   }
 }
 
@@ -167,14 +170,16 @@ const char *driveModeToText(DriveMode m)
 {
   switch (m)
   {
-  case MODE_NORMAL:
-    return "Normal";
+  case MODE_COMFORT:
+    return "Comfort";
   case MODE_SPORT:
     return "Sport";
   case MODE_SPORTP:
     return "Sport+";
+  case MODE_MANUAL:
+    return "Manual";
   default:
-    return "Normal";
+    return "Comfort";
   }
 }
 
@@ -228,6 +233,7 @@ void drawProgressBarWithInvertedText(
     u8g2.drawBox(x + 1, y + 1, fillW, innerH);
   }
 
+  u8g2.setFont(u8g2_font_6x10_tf);
   // Center text
   int tw = u8g2.getStrWidth(text);
   int ascent = u8g2.getAscent();
@@ -253,7 +259,7 @@ void drawProgressBarWithInvertedText(
   }
 
   u8g2.setDrawColor(1); // restore default
-  
+
   // Frame
   u8g2.drawFrame(x, y, w, h);
 }
@@ -276,15 +282,15 @@ void draw_main_page()
   u8g2.print(g);
 
   // Mode square to the right of gear (small)
-  int boxSize = 18;
+  int boxSize = 20;
   int boxX = min(128 - boxSize - 2, gx + gw + 24);
-  int boxY = 12;
-  u8g2.drawFrame(boxX, boxY, boxSize, boxSize);
+  int boxY = 11;
+  u8g2.drawFrame(boxX, boxY, boxSize, boxSize-2);
 
-  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.setFont(u8g2_font_t0_15b_tf);
   const char *ms = driveModeToShort(driveMode);
   int msw = u8g2.getStrWidth(ms);
-  u8g2.setCursor(boxX + (boxSize - msw) / 2, boxY + 13);
+  u8g2.setCursor(boxX + (boxSize - msw) / 2, boxY + 14);
   u8g2.print(ms);
 
   char mapTxt[20];
