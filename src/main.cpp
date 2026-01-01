@@ -1,6 +1,8 @@
 #include <SPI.h>
 #include <U8g2lib.h>
 #include <mcp_can.h>
+// -------- Splash bitmap --------
+#include "amg_logo.h" // defines AMG_W, AMG_H, amg_bits[]
 
 // -------- Pins --------
 static const uint8_t OLED_CS = 10;
@@ -12,6 +14,28 @@ static const uint8_t CAN_CS = 7;
 static const uint8_t BTN_MODE = 4;
 static const uint8_t BTN_PAGE = 5;
 
+static const uint32_t BOTH_HOLD_MS = 1000;
+static const uint32_t SELECT_WINDOW_MS = 3000;
+
+static const uint8_t PADDLE_L_PIN = 2;
+static const uint8_t PADDLE_R_PIN = 3;
+
+static const uint32_t SPLASH_MS = 2000;
+static const uint32_t MODE_ANNOUNCE_MS = 1500;
+
+uint32_t bootMs = 0;
+uint32_t modeAnnounceStartMs = 0;
+
+enum Prnd : uint8_t
+{
+  PRND_P,
+  PRND_R,
+  PRND_N,
+  PRND_D
+};
+
+Prnd prnd = PRND_P;
+
 enum UiMode
 {
   UI_SPLASH,
@@ -19,12 +43,6 @@ enum UiMode
   UI_MODE_ANNOUNCE
 };
 UiMode uiMode = UI_SPLASH;
-
-static const uint32_t SPLASH_MS = 2000;
-static const uint32_t MODE_ANNOUNCE_MS = 1500;
-
-uint32_t bootMs = 0;
-uint32_t modeAnnounceStartMs = 0;
 
 enum DriveMode : uint8_t
 {
@@ -45,9 +63,6 @@ U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0, OLED_CS, OLED_DC, OLED_RST)
 
 // -------- CAN --------
 MCP_CAN CAN0(CAN_CS);
-
-// -------- Splash bitmap --------
-#include "amg_logo.h" // defines AMG_W, AMG_H, amg_bits[]
 
 // -------- UI timing --------
 static const uint32_t UI_PERIOD_MS = 100; // 10 FPS
@@ -109,12 +124,71 @@ struct Button
       stable = r;
       if (prev == HIGH && stable == LOW)
         return true; // pressed
+      Serial.print("button ");
+      Serial.print(pin);
+      Serial.println(" pressed");
     }
     return false;
   }
+
+  // call every loop; returns true once on press edge (HIGH->LOW)
+  bool pressedEdge()
+  {
+    bool r = digitalRead(pin);
+    uint32_t now = millis();
+    if (r != lastRead)
+    {
+      lastRead = r;
+      lastChangeMs = now;
+    }
+    if ((now - lastChangeMs) >= DEBOUNCE_MS && r != stable)
+    {
+      bool prev = stable;
+      stable = r;
+      if (prev == HIGH && stable == LOW)
+        return true;
+    }
+    return false;
+  }
+
+  bool isPressedNow() const { return stable == LOW; }
 };
 
-Button btnMode, btnPage;
+Button btnMode, btnPage, paddleL, paddleR;
+
+// combo / window tracking
+bool bothHoldArmed = false;
+uint32_t bothPressedSinceMs = 0;
+
+bool selectWindowActive = false;
+uint32_t selectWindowStartMs = 0;
+
+const char *prndToStr(Prnd p)
+{
+  switch (p)
+  {
+  case PRND_P:
+    return "P";
+  case PRND_R:
+    return "R";
+  case PRND_N:
+    return "N";
+  case PRND_D:
+    return "D";
+  default:
+    return "?";
+  }
+}
+
+Prnd lastPrintedPrnd = PRND_P;
+
+void onPrndChanged(Prnd newState)
+{
+  if (newState == lastPrintedPrnd)
+    return;
+
+  lastPrintedPrnd = newState;
+}
 
 // -------- CAN decoded values (fill these from EMU Black frames) --------
 volatile uint32_t lastCanMs = 0;
@@ -125,6 +199,7 @@ int clt = 0;    // coolant C
 int iat = 0;    // intake C
 float oilp = 0; // bar/psi
 float lambda = 1.00;
+uint32_t odo = 423911;
 
 // ----------------- Helpers -----------------
 void draw_splash()
@@ -171,15 +246,15 @@ const char *driveModeToText(DriveMode m)
   switch (m)
   {
   case MODE_COMFORT:
-    return "Comfort";
+    return "COMFORT";
   case MODE_SPORT:
-    return "Sport";
+    return "SPORT";
   case MODE_SPORTP:
-    return "Sport+";
+    return "SPORT+";
   case MODE_MANUAL:
-    return "Manual";
+    return "MANUAL";
   default:
-    return "Comfort";
+    return "COMFORT";
   }
 }
 
@@ -261,45 +336,194 @@ void drawProgressBarWithInvertedText(
   u8g2.setDrawColor(1); // restore default
 
   // Frame
+  u8g2.drawRFrame(x, y, w, h, 3);
+}
+
+void drawLambdaLine(
+    int x, int y, int w, int h,
+    float lambda,
+    float minL, float maxL)
+{
+  // Frame
   u8g2.drawFrame(x, y, w, h);
+
+  // Clamp
+  if (lambda < minL)
+    lambda = minL;
+  if (lambda > maxL)
+    lambda = maxL;
+
+  // Inner dimensions
+  int innerW = w - 2;
+  int innerH = h - 2;
+
+  // Position of lambda line
+  int lineX = x + 1 + (int)((lambda - minL) * innerW / (maxL - minL));
+
+  // Draw center reference line (optional, stoich = 1.00)
+  if (minL < 1.0f && maxL > 1.0f)
+  {
+    int stoichX = x + 1 + (int)((1.0f - minL) * innerW / (maxL - minL));
+    u8g2.drawVLine(stoichX, y + 1, innerH);
+  }
+
+  // Draw lambda marker (thicker for visibility)
+  u8g2.drawVLine(lineX, y + 1, innerH);
+  u8g2.drawVLine(lineX + 1, y + 1, innerH); // thickness = 2px
+}
+
+void drawDriveMode(int boxX, int boxY, boolean isShort)
+{
+  // Mode square to the right of gear (small)
+  int boxSize = 15;
+  const char *ms;
+  if (isShort)
+  {
+    u8g2.setFont(u8g2_font_t0_15b_tf);
+    ms = driveModeToShort(driveMode);
+  }
+  else
+  {
+    u8g2.setFont(u8g2_font_5x7_tf);
+    ms = driveModeToText(driveMode);
+  }
+  int msw = u8g2.getStrWidth(ms);
+  u8g2.setCursor(boxX + (boxSize - msw) / 2, boxY + 10);
+  u8g2.print(ms);
+}
+
+void drawSelectionActive(int x, int y, int size)
+{
+  // y is top of triangle
+  u8g2.drawTriangle(
+      x + size / 2, y,
+      x + size / 2, y + size,
+      x, y + size / 2);
+
+  int offset = size / 2 + 2;
+
+  u8g2.drawTriangle(
+      x + offset, y,
+      x + offset, y + size,
+      x + size / 2 + offset, y + size / 2);
+}
+
+void drawPRND(int x, int y)
+{
+  if (selectWindowActive)
+  {
+    drawSelectionActive(x + 16, y - 7, 6);
+  }
+
+  u8g2.drawBox(x + 16, y, 9, 13);
+  u8g2.setDrawColor(0);
+  u8g2.setCursor(x + 16, y + 12);
+  u8g2.setFont(u8g2_font_t0_18b_tr);
+  u8g2.print(prndToStr(prnd));
+  u8g2.setDrawColor(1);
+
+  switch (prnd)
+  {
+  case PRND_P:
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.setCursor(x + 26, y + 10);
+    u8g2.print("RND");
+    break;
+
+  case PRND_R:
+    u8g2.setCursor(x + 11, y + 10);
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.print("P");
+    u8g2.setCursor(x + 26, y + 10);
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.print("ND");
+    break;
+
+  case PRND_N:
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.print("PR");
+    u8g2.setCursor(x + 26, y + 10);
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.print("D");
+    break;
+
+  case PRND_D:
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.setCursor(x + 1, y + 10);
+    u8g2.print("PRN");
+    break;
+
+  default:
+    break;
+  }
+}
+
+void drawActualGear(int y)
+{
+  u8g2.drawRBox(53, y, 22, 23, 3);
+  u8g2.setFont(u8g2_font_luBS19_te);
+  const char *g = gearToStr(gear);
+
+  // Measure text width to truly center
+  int gw = u8g2.getStrWidth(g);
+  int gx = (128 - gw) / 2;
+  int gy = y + 21; // baseline near top row
+  u8g2.setDrawColor(0);
+  u8g2.setFontMode(1);
+  u8g2.setCursor(gx, gy);
+  u8g2.print(g);
+  u8g2.setDrawColor(1);
+}
+
+void drawOdometerCentered(uint32_t odometer_km, int baselineY)
+{
+  char num[12];
+  snprintf(num, sizeof(num), "%lu", (unsigned long)odometer_km);
+
+  const char *unit = "km";
+  const int gap = 3;
+
+  // Measure widths in their respective fonts
+  u8g2.setFont(u8g2_font_6x13B_mf);
+  int wNum = u8g2.getStrWidth(num);
+
+  u8g2.setFont(u8g2_font_6x10_tf);
+  int wUnit = u8g2.getStrWidth(unit);
+
+  int totalW = wNum + gap + wUnit;
+  int x = (128 - totalW) / 2;
+
+  // Draw number
+  u8g2.setFont(u8g2_font_6x13B_mf);
+  u8g2.setCursor(x, baselineY);
+  u8g2.print(num);
+
+  // Draw unit
+  u8g2.setFont(u8g2_font_5x8_mf);
+  u8g2.setCursor(x + wNum + gap, baselineY);
+  u8g2.print(unit);
 }
 
 void draw_main_page()
 {
   u8g2.clearBuffer();
 
-  // --- Top row: Gear centered + mode square to the right ---
-  // Big gear text centered at top
-  u8g2.setFont(u8g2_font_helvB18_tf);
-  const char *g = gearToStr(gear);
-  u8g2.drawRFrame(50, 2, 27, 27, 3);
+  // AMG logo
+  u8g2.drawXBMP(77, 56, AMG_SMALL_W, AMG_SMALL_H, amg_bits_small);
 
-  // Measure text width to truly center
-  int gw = u8g2.getStrWidth(g);
-  int gx = (128 - gw) / 2;
-  int gy = 25; // baseline near top row
-  u8g2.setCursor(gx, gy);
-  u8g2.print(g);
+  drawOdometerCentered(odo, 18);
+  drawOdometerCentered(839, 30);
 
-  // Mode square to the right of gear (small)
-  int boxSize = 20;
-  int boxX = min(128 - boxSize - 2, gx + gw + 24);
-  int boxY = 11;
-  u8g2.drawFrame(boxX, boxY, boxSize, boxSize-2);
+  drawDriveMode(96, 44, false);
+  drawPRND(5, 48);
+  drawActualGear(41);
 
-  u8g2.setFont(u8g2_font_t0_15b_tf);
-  const char *ms = driveModeToShort(driveMode);
-  int msw = u8g2.getStrWidth(ms);
-  u8g2.setCursor(boxX + (boxSize - msw) / 2, boxY + 14);
-  u8g2.print(ms);
+  switch (currentPage)
+  {
+  case PAGE_MAIN:
+    break;
+  }
 
-  char mapTxt[20];
-  snprintf(mapTxt, sizeof(mapTxt), "MAP %d kpa", map_kpa);
-  drawProgressBarWithInvertedText(0, 34, 128, 11, map_kpa, 0, 250, mapTxt);
-
-  char rpmTxt[20];
-  snprintf(rpmTxt, sizeof(rpmTxt), "RPM %d", rpm);
-  drawProgressBarWithInvertedText(0, 50, 128, 11, rpm, 0, 9000, rpmTxt);
   u8g2.sendBuffer();
 }
 
@@ -309,21 +533,15 @@ void draw_sensors_page()
   u8g2.setFont(u8g2_font_6x10_tf);
   u8g2.drawStr(0, 10, "Sensors");
 
-  u8g2.setCursor(0, 24);
-  u8g2.print("CLT: ");
-  u8g2.print(clt);
-  u8g2.print(" C");
-  u8g2.setCursor(0, 36);
-  u8g2.print("IAT: ");
-  u8g2.print(iat);
-  u8g2.print(" C");
-  u8g2.setCursor(0, 48);
-  u8g2.print("TPS: ");
-  u8g2.print(tps);
-  u8g2.print(" %");
-  u8g2.setCursor(0, 60);
-  u8g2.print("RPM: ");
-  u8g2.print(rpm);
+  char mapTxt[20];
+  snprintf(mapTxt, sizeof(mapTxt), "MAP %d kpa", map_kpa);
+  drawProgressBarWithInvertedText(0, 39, 128, 11, map_kpa, 0, 250, mapTxt);
+
+  char rpmTxt[20];
+  snprintf(rpmTxt, sizeof(rpmTxt), "RPM %d", rpm);
+  drawProgressBarWithInvertedText(0, 52, 128, 11, rpm, 0, 9000, rpmTxt);
+
+  drawLambdaLine(0, 15, 128, 11, 0.94, 0.70, 1.24);
 
   u8g2.sendBuffer();
 }
@@ -447,6 +665,75 @@ void draw_mode_announcement()
   u8g2.sendBuffer();
 }
 
+void openDriveSelectWindow()
+{
+  selectWindowActive = true;
+  selectWindowStartMs = millis();
+}
+
+void updatePaddles()
+{
+  // Update debouncers and capture press edges
+  bool leftPressedEdge = paddleL.pressedEdge();
+  bool rightPressedEdge = paddleR.pressedEdge();
+
+  bool leftHeld = paddleL.isPressedNow();
+  bool rightHeld = paddleR.isPressedNow();
+  uint32_t now = millis();
+
+  // --- 1) BOTH-HOLD gesture (1s) triggers P -> N and opens 500ms window ---
+  if (leftHeld && rightHeld)
+  {
+    if (bothPressedSinceMs == 0)
+      bothPressedSinceMs = now;
+
+    // Only trigger once per hold
+    if (!bothHoldArmed && (now - bothPressedSinceMs >= BOTH_HOLD_MS))
+    {
+      bothHoldArmed = true;
+      openDriveSelectWindow();
+      // If you later want "both hold to go to N from anywhere", do it here.
+    }
+  }
+  else
+  {
+    // combo released -> reset
+    bothPressedSinceMs = 0;
+    bothHoldArmed = false;
+  }
+
+  // --- 2) Selection window: N -> D/R within 500ms after P->N ---
+  if (selectWindowActive)
+  {
+    if (now - selectWindowStartMs > SELECT_WINDOW_MS)
+    {
+      selectWindowActive = false; // window expired, stay in N
+    }
+    else
+    {
+      // Only accept a single decision during the window
+      if (rightPressedEdge)
+      {
+        prnd = PRND_D;
+        selectWindowActive = false;
+      }
+      else if (leftPressedEdge)
+      {
+        prnd = PRND_R;
+        selectWindowActive = false;
+      }
+    }
+    return; // while in window, ignore other paddle functions
+  }
+
+  // --- 3) Outside the window: paddles can do other actions ---
+  // Example: if in D, use paddles for +/- shifting (optional)
+  // if (prnd == PRND_D) { if (rightPressedEdge) upshift(); if (leftPressedEdge) downshift(); }
+
+  // Or allow N -> D/R anytime by a single press (optional, NOT what you asked)
+  // if (prnd == PRND_N) { if (rightPressedEdge) prnd=PRND_D; if (leftPressedEdge) prnd=PRND_R; }
+}
+
 void setup()
 {
   // CS pins idle high
@@ -458,8 +745,12 @@ void setup()
   btnMode.begin(BTN_MODE);
   btnPage.begin(BTN_PAGE);
 
+  paddleL.begin(PADDLE_L_PIN);
+  paddleR.begin(PADDLE_R_PIN);
+
   SPI.begin();
   u8g2.begin();
+  Serial.begin(115200);
 
   // // Init CAN: adjust bitrate + oscillator for your MCP2515 module
   // // Common: MCP_8MHZ or MCP_16MHZ. EMU Black often 500kbps depending on config.
@@ -479,7 +770,9 @@ void setup()
 
 void loop()
 {
+  u8g2.setContrast(30);
   read_can(); // keep CAN serviced always
+  updatePaddles();
 
   // Buttons
   if (btnMode.pressed())
